@@ -1,12 +1,14 @@
 import math
-# for torch optim sgd
 import numpy as np
 import torch
+
+# eps for numerical stability
+eps = 1e-15
 
 class YFOptimizer(object):
   def __init__(self, var_list, lr=0.1, mu=0.0, clip_thresh=None, weight_decay=0.0,
     beta=0.999, curv_win_width=20, zero_debias=True, sparsity_debias=True, delta_mu=0.0, 
-    auto_clip_fac=None, force_non_inc_step_after_iter=None):
+    auto_clip_fac=None, force_non_inc_step=False):
     '''
     clip thresh is the threshold value on ||lr * gradient||
     delta_mu can be place holder/variable/python scalar. They are used for additional
@@ -25,9 +27,11 @@ class YFOptimizer(object):
       e.g. LSTM with word embedding. For non-sparse CNN, turning it off could slightly
       accelerate the speed.
       delta_mu: for extensions. Not necessary in the basic use. 
-      force_non_inc_step_after_iter: in some rare cases, it is necessary to force ||lr * gradient||
-      to be non-increasing for stableness after some iterations. 
-      Default is turning off this feature.
+      force_non_inc_step: in some very rare cases, it is necessary to force ||lr * gradient||
+      to be not increasing dramatically for stableness after some iterations. 
+      In practice, if turned on, we enforce lr * sqrt(smoothed ||grad||^2) 
+      to be less than 2x of the minimal value of historical value on smoothed || lr * grad ||. 
+      This feature is turned off by default.
     Other features:
       If you want to manually control the learning rates, self.lr_factor is
       an interface to the outside, it is an multiplier for the internal learning rate
@@ -47,7 +51,7 @@ class YFOptimizer(object):
     self._curv_win_width = curv_win_width
     self._zero_debias = zero_debias
     self._sparsity_debias = sparsity_debias
-    self._force_non_inc_step_after_iter = force_non_inc_step_after_iter
+    self._force_non_inc_step = force_non_inc_step
     self._optimizer = torch.optim.SGD(self._var_list, lr=self._lr, 
       momentum=self._mu, weight_decay=weight_decay)
     self._iter = 0
@@ -56,10 +60,10 @@ class YFOptimizer(object):
 
     # for decaying learning rate and etc.
     self._lr_factor = 1.0
-    pass
 
 
   def state_dict(self):
+    # for checkpoint saving
     sgd_state_dict = self._optimizer.state_dict()
     global_state = self._global_state
     lr_factor = self._lr_factor
@@ -70,6 +74,8 @@ class YFOptimizer(object):
     beta = self._beta
     curv_win_width = self._curv_win_width
     zero_debias = self._zero_debias
+    h_min = self._h_min
+    h_max = self._h_max
 
     return {
       "sgd_state_dict": sgd_state_dict,
@@ -82,10 +88,13 @@ class YFOptimizer(object):
       "beta": beta,
       "curv_win_width": curv_win_width,
       "zero_debias": zero_debias,
+      "h_min": h_min,
+      "h_max": h_max
     }
 
 
   def load_state_dict(self, state_dict):
+    # for checkpoint saving
     self._optimizer.load_state_dict(state_dict['sgd_state_dict'])
     self._global_state = state_dict['global_state']
     self._lr_factor = state_dict['lr_factor']
@@ -96,6 +105,9 @@ class YFOptimizer(object):
     self._beta = state_dict['beta']
     self._curv_win_width = state_dict['curv_win_width']
     self._zero_debias = state_dict['zero_debias']
+    self._h_min = state_dict["h_min"]
+    self._h_max = state_dict["h_max"]
+    return
 
 
   def set_lr_factor(self, factor):
@@ -109,6 +121,7 @@ class YFOptimizer(object):
 
   def zero_grad(self):
     self._optimizer.zero_grad()
+    return
 
 
   def zero_debias_factor(self):
@@ -126,7 +139,7 @@ class YFOptimizer(object):
       global_state["curv_win"] = torch.FloatTensor(self._curv_win_width, 1).zero_()
     curv_win = global_state["curv_win"]
     grad_norm_squared = self._global_state["grad_norm_squared"]
-    curv_win[self._iter % self._curv_win_width] = np.log(grad_norm_squared)
+    curv_win[self._iter % self._curv_win_width] = np.log(grad_norm_squared + eps)
     valid_end = min(self._curv_win_width, self._iter + 1)
     # we use running average over log scale, accelerating 
     # h_max / min in the begining to follow the varying trend of curvature.
@@ -178,7 +191,7 @@ class YFOptimizer(object):
     self._grad_var /= -(debias_factor**2)
     self._grad_var += global_state['grad_norm_squared_avg'] / debias_factor
     # in case of negative variance: the two term are using different debias factors
-    self._grad_var = max(self._grad_var, 1e-6)
+    self._grad_var = max(self._grad_var, eps)
     if self._sparsity_debias:
       self._grad_var *= self._sparsity_avg
     return
@@ -194,14 +207,14 @@ class YFOptimizer(object):
       global_state["grad_norm_avg"] * beta + (1 - beta) * math.sqrt(global_state["grad_norm_squared"] )
     global_state["dist_to_opt_avg"] = \
       global_state["dist_to_opt_avg"] * beta \
-      + (1 - beta) * global_state["grad_norm_avg"] / global_state['grad_norm_squared_avg']
+      + (1 - beta) * global_state["grad_norm_avg"] / (global_state['grad_norm_squared_avg'] + eps)
     if self._zero_debias:
       debias_factor = self.zero_debias_factor()
       self._dist_to_opt = global_state["dist_to_opt_avg"] / debias_factor
     else:
       self._dist_to_opt = global_state["dist_to_opt_avg"]
     if self._sparsity_debias:
-      self._dist_to_opt /= np.sqrt(self._sparsity_avg)
+      self._dist_to_opt /= (np.sqrt(self._sparsity_avg) + eps)
     return
 
 
@@ -216,7 +229,9 @@ class YFOptimizer(object):
         if p.grad is None:
           continue
         grad = p.grad.data
-        non_zero_cnt += torch.nonzero(grad).size()[0]
+        grad_non_zero = grad.nonzero()
+        if grad_non_zero.dim() > 0:
+          non_zero_cnt += grad_non_zero.size()[0]
         all_entry_cnt += torch.numel(grad)
     beta = self._beta
     global_state["sparsity_avg"] = beta * global_state["sparsity_avg"] \
@@ -227,28 +242,28 @@ class YFOptimizer(object):
 
 
   def lr_grad_norm_avg(self):
-    # this is for enforcing non-increasing lr * grad_norm after 
-    # certain number of iterations. Not necessary for basic use.
+    # this is for enforcing lr * grad_norm not 
+    # increasing dramatically in case of instability.
+    #  Not necessary for basic use.
     global_state = self._global_state
     beta = self._beta
     if "lr_grad_norm_avg" not in global_state:
       global_state['grad_norm_squared_avg_log'] = 0.0
     global_state['grad_norm_squared_avg_log'] = \
-      global_state['grad_norm_squared_avg_log'] * beta + (1 - beta) * np.log(global_state['grad_norm_squared'] )
+      global_state['grad_norm_squared_avg_log'] * beta \
+      + (1 - beta) * np.log(global_state['grad_norm_squared'] + eps)
     if "lr_grad_norm_avg" not in global_state:
       global_state["lr_grad_norm_avg"] = \
-        0.0 * beta + (1 - beta) * np.log(self._lr * np.sqrt(global_state['grad_norm_squared'] ) )
+        0.0 * beta + (1 - beta) * np.log(self._lr * np.sqrt(global_state['grad_norm_squared'] ) + eps)
+      # we monitor the minimal smoothed ||lr * grad||
+      global_state["lr_grad_norm_avg_min"] = \
+        np.exp(global_state["lr_grad_norm_avg"] / self.zero_debias_factor() )
     else:
-      undebias_val = global_state["lr_grad_norm_avg"] * beta \
-        + (1 - beta) * np.log(self._lr * np.sqrt(global_state['grad_norm_squared'] ) )
-      debias_factor = self.zero_debias_factor_delay(self._force_non_inc_step_after_iter)
-      debias_factor_prev = self.zero_debias_factor_delay(self._force_non_inc_step_after_iter + 1)
-      prev_val = global_state["lr_grad_norm_avg"] / debias_factor_prev
-      val = undebias_val / debias_factor
-      if prev_val > val:
-        global_state["lr_grad_norm_avg"] = undebias_val
-      else:
-        global_state["lr_grad_norm_avg"] = prev_val * debias_factor
+      global_state["lr_grad_norm_avg"] = global_state["lr_grad_norm_avg"] * beta \
+        + (1 - beta) * np.log(self._lr * np.sqrt(global_state['grad_norm_squared'] ) + eps)
+      global_state["lr_grad_norm_avg_min"] = \
+        min(global_state["lr_grad_norm_avg_min"], 
+            np.exp(global_state["lr_grad_norm_avg"] / self.zero_debias_factor() ) )
 
 
   def after_apply(self):
@@ -268,7 +283,6 @@ class YFOptimizer(object):
         
     global_state['grad_norm_squared_avg'] = \
       global_state['grad_norm_squared_avg'] * beta + (1 - beta) * global_state['grad_norm_squared']
-    # global_state['grad_norm_squared_avg'].mul_(beta).add_(1 - beta, global_state['grad_norm_squared'] )
         
     if self._sparsity_debias:
       self.grad_sparsity()
@@ -280,42 +294,55 @@ class YFOptimizer(object):
     if self._iter > 0:
       self.get_mu()    
       self.get_lr()
+
       self._lr = beta * self._lr + (1 - beta) * self._lr_t
       self._mu = beta * self._mu + (1 - beta) * self._mu_t
     return
 
 
   def get_lr(self):
-    self._lr_t = (1.0 - math.sqrt(self._mu_t) )**2 / self._h_min
+    self._lr_t = (1.0 - math.sqrt(self._mu_t) )**2 / (self._h_min + eps)
     return
 
 
+  def get_cubic_root(self):
+    # We have the equation x^2 D^2 + (1-x)^4 * C / h_min^2
+    # where x = sqrt(mu).
+    # We substitute x, which is sqrt(mu), with x = y + 1.
+    # It gives y^3 + py = q
+    # where p = (D^2 h_min^2)/(2*C) and q = -p.
+    # We use the Vieta's substution to compute the root.
+    # There is only one real solution y (which is in [0, 1] ).
+    # http://mathworld.wolfram.com/VietasSubstitution.html
+    # eps in the numerator is to prevent momentum = 1 in case of zero gradient
+    p = (self._dist_to_opt + eps)**2 * (self._h_min + eps)**2 / 2 / (self._grad_var + eps)
+    w3 = (-math.sqrt(p**2 + 4.0 / 27.0 * p**3) - p) / 2.0
+    w = math.copysign(1.0, w3) * math.pow(math.fabs(w3), 1.0/3.0)
+    y = w - p / 3.0 / (w + eps)
+    x = y + 1
+    return x
+
+
   def get_mu(self):
-    coef = [-1.0, 3.0, 0.0, 1.0]
-    coef[2] = -(3 + self._dist_to_opt**2 * self._h_min**2 / 2 / self._grad_var)
-    roots = np.roots(coef)
-    root = roots[np.logical_and(np.logical_and(np.real(roots) > 0.0, 
-      np.real(roots) < 1.0), np.imag(roots) < 1e-5) ]
-    assert root.size == 1
+    root = self.get_cubic_root()
     dr = self._h_max / self._h_min
-    self._mu_t = max(np.real(root)[0]**2, ( (np.sqrt(dr) - 1) / (np.sqrt(dr) + 1) )**2 )
+    self._mu_t = max(root**2, ( (np.sqrt(dr) - 1) / (np.sqrt(dr) + 1) )**2 )
     return 
 
 
   def update_hyper_param(self):
     for group in self._optimizer.param_groups:
       group['momentum'] = self._mu
-      if self._force_non_inc_step_after_iter == None or self._iter < self._force_non_inc_step_after_iter:
+      if self._force_non_inc_step == False:
         group['lr'] = self._lr * self._lr_factor
-      else:
-        # for the learning rate we force to guarantee 
-        # lr * grad_norm is non-increasing. Note exponentially
-        # averaged stat in lr_grad_norm_avg starts at iteration
-        # self._force_non_inc_step_after_iter. Not necessary for basic use.
+      elif self._iter > self._curv_win_width:
+        # force to guarantee lr * grad_norm not increasing dramatically. 
+        # Not necessary for basic use. Please refer to the comments
+        # in YFOptimizer.__init__ for more details
         self.lr_grad_norm_avg()
-        debias_factor = self.zero_debias_factor_delay(self._force_non_inc_step_after_iter)
+        debias_factor = self.zero_debias_factor()
         group['lr'] = min(self._lr * self._lr_factor,
-          np.exp(self._global_state["lr_grad_norm_avg"] / debias_factor) \
+          2.0 * self._global_state["lr_grad_norm_avg_min"] \
           / np.sqrt(np.exp(self._global_state['grad_norm_squared_avg_log'] / debias_factor) ) )
     return
 
@@ -342,7 +369,6 @@ class YFOptimizer(object):
     elif (self._iter != 0 and self._auto_clip_fac != None):
       # do not clip the first iteration
       torch.nn.utils.clip_grad_norm(self._var_list, self.auto_clip_thresh() )
-
 
     # apply update
     self._optimizer.step()
